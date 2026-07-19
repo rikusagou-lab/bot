@@ -19,7 +19,7 @@ async def update_list_message(bot):
             msg = await channel.fetch_message(bot.list_message_id)
             current_list_text = "\n".join(bot.player_details.values()) if bot.player_details else "現在、登録者はいません。"
             embed = discord.Embed(
-                title="🏆 大会エントリー 参加者名簿一覧",
+                title="参加者　一覧",
                 description=f"現在の登録者（計 {len(bot.player_details)} 名）:\n\n{current_list_text}",
                 color=0x9b59b6
             )
@@ -36,7 +36,7 @@ async def create_list_message(bot):
         try:
             current_list_text = "\n".join(bot.player_details.values()) if bot.player_details else "現在、登録者はいません。"
             embed = discord.Embed(
-                title="🏆 大会エントリー 参加者名簿一覧",
+                title="参加者　一覧",
                 description=f"現在の登録者（計 {len(bot.player_details)} 名）:\n\n{current_list_text}",
                 color=0x9b59b6
             )
