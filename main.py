@@ -2,11 +2,21 @@
 大会運営用 Discord Bot
 --------------------------------
 実装コマンド:
-  /can        大会エントリー用モーダルを表示
+  /format     管理者、または主催ロールを持つ人が使える
+                - 大会形式を設定する(FFA / 2v2 / 3v3 / 4v4 / 6v6 / 8v8 / 12v12)
+                - FFAなら /can /drop、それ以外なら /can_team /drop が使えるようになる
+  /can        大会エントリー用モーダルを表示(FFA形式の時のみ使用可)
                 - 大会で使用したい名前 (必須)
                 - フレンドコード (必須)
                 - 進行役をやっていただけるか (任意・「はい」の場合のみ記入)
-  /drop       エントリー取り消し用モーダルを表示
+                - 名前がソロ・チーム問わず既に使われていた場合はエラーになる
+  /can_team   チームで大会にエントリー(FFA以外の形式の時のみ使用可)
+                - 使用した人がチームのリーダーになる
+                - チームタグ・チーム名・メンバー(1行に「名前 フレンドコード」を
+                  大会形式で決まった人数分)を入力する
+                - チームは /room で必ず同じ部屋にまとまる
+                - 名前・タグがソロ・チーム問わず既に使われていた場合はエラーになる
+  /drop       エントリー取り消し用モーダルを表示(チーム戦はリーダーのみ実行可)
                 - 「はい」と正確に入力した場合のみ取り消し成立
   /help       誰でも使える
                 - コマンド一覧と説明を表示する(自分にだけ見える形で返信)
@@ -56,8 +66,13 @@
                   自動生成してスレッドに投稿し、✅❌のリアクションを付ける
                 - ✅が6票入るか、30秒後に✅が❌より多ければ自動的に確定し、
                   指定チャンネルへ最終結果(画像+通過者リスト)を投稿する
+                - /passlist で指定したチャンネルにも通過者リストだけ投稿する
                 - 確定すると、通過者だけがエントリー一覧に残る
                   (続けて /room を実行すれば次ラウンドの組分けができる)
+  /passlist   管理者、または主催ロールを持つ人が使える
+                - 通過者リストだけをまとめて投稿するチャンネルを指定する
+                - /result の確定時に、最終結果とは別にこのチャンネルへも
+                  通過者名(進★付き)だけの一覧が自動投稿される
 
 必要なライブラリ:
   pip install -U discord.py python-dotenv
@@ -120,6 +135,45 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # { user_id: {"name": str, "friend_code": str, "organizer": bool, "checked_in": bool} }
 entries: dict[int, dict] = {}
 
+# チームエントリー情報(チーム戦形式の時のみ使用。キーはリーダーのuser_id)
+# { leader_id: {"tag": str, "team_name": str,
+#   "members": [{"name": str, "friend_code": str}, ...], "checked_in": bool} }
+team_entries: dict[int, dict] = {}
+
+# 大会形式 ( { guild_id: "FFA" | "2v2" | "3v3" | "4v4" | "6v6" | "8v8" | "12v12" } )
+# 未設定の場合は FFA 扱い
+tournament_formats: dict[int, str] = {}
+TEAM_SIZES = {"FFA": 1, "2v2": 2, "3v3": 3, "4v4": 4, "6v6": 6, "8v8": 8, "12v12": 12}
+
+
+def get_format(guild_id: int) -> str:
+    return tournament_formats.get(guild_id, "FFA")
+
+
+def get_team_size(guild_id: int) -> int:
+    return TEAM_SIZES.get(get_format(guild_id), 1)
+
+
+def all_taken_names(exclude_uid: int | None = None) -> set[str]:
+    """現在使用されている名前(ソロ参加者名+チームメンバー名)を集める"""
+    names = set()
+    for uid, data in entries.items():
+        if uid == exclude_uid:
+            continue
+        names.add(data["name"])
+    for uid, team in team_entries.items():
+        if uid == exclude_uid:
+            continue
+        for member in team["members"]:
+            names.add(member["name"])
+    return names
+
+
+def all_taken_tags(exclude_uid: int | None = None) -> set[str]:
+    """現在使用されているチームタグを集める"""
+    return {team["tag"] for uid, team in team_entries.items() if uid != exclude_uid}
+
+
 # /can /drop の使用を許可するロール ( { guild_id: role_id } )
 # 未設定(該当キーなし)の場合は誰でも使用可能
 allowed_roles: dict[int, int] = {}
@@ -150,20 +204,34 @@ passing_counts: dict[int, int] = {}
 # 最終リザルトを投稿するチャンネル ( { guild_id: channel_id } )
 result_channels: dict[int, int] = {}
 
+# 通過者リストだけをまとめて投稿するチャンネル ( { guild_id: channel_id } )
+passlist_channels: dict[int, int] = {}
+
 # 現在リザルト確定の投票中のスレッド ( 二重トリガー防止用 )
 voting_in_progress: set[int] = set()
 
 
-def render_entry_list() -> str:
-    """現在のエントリー一覧を1行1人の形式でテキスト化する"""
-    if not entries:
-        return "(現在エントリーはありません)"
-    lines = []
-    for data in entries.values():
-        prefix = "進★" if data["organizer"] else ""
-        status = "✅" if data.get("checked_in") else "❌"
-        lines.append(f"{prefix}{data['name']} {data['friend_code']} {status}")
-    return "\n".join(lines)
+def render_entry_list(guild_id: int) -> str:
+    """現在のエントリー一覧をテキスト化する(大会形式によってソロ/チームを切り替え)"""
+    if get_format(guild_id) == "FFA":
+        if not entries:
+            return "(現在エントリーはありません)"
+        lines = []
+        for data in entries.values():
+            prefix = "進★" if data["organizer"] else ""
+            status = "✅" if data.get("checked_in") else "❌"
+            lines.append(f"{prefix}{data['name']} {data['friend_code']} {status}")
+        return "\n".join(lines)
+    else:
+        if not team_entries:
+            return "(現在エントリーはありません)"
+        blocks = []
+        for team in team_entries.values():
+            status = "✅" if team.get("checked_in") else "❌"
+            header = f"[{team['tag']}] {team['team_name']} {status}"
+            member_lines = "\n".join(f"　{m['name']} {m['friend_code']}" for m in team["members"])
+            blocks.append(f"{header}\n{member_lines}")
+        return "\n\n".join(blocks)
 
 
 async def update_entry_list(guild: discord.Guild) -> None:
@@ -175,7 +243,7 @@ async def update_entry_list(guild: discord.Guild) -> None:
     if channel is None:
         return
 
-    content = render_entry_list()
+    content = render_entry_list(guild.id)
     message_id = entry_list_messages.get(guild.id)
 
     if message_id is not None:
@@ -283,17 +351,25 @@ class EntryModal(discord.ui.Modal, title="大会エントリー"):
 
     async def on_submit(self, interaction: discord.Interaction):
         is_organizer = self.organizer_flag.value.strip() == "はい"
+        name = self.tournament_name.value.strip()
+        friend_code = self.friend_code.value.strip()
+
+        if name in all_taken_names(exclude_uid=interaction.user.id):
+            await interaction.response.send_message(
+                f"名前「{name}」は既に他の参加者(またはチーム)で使用されています。", ephemeral=True
+            )
+            return
 
         entries[interaction.user.id] = {
-            "name": self.tournament_name.value.strip(),
-            "friend_code": self.friend_code.value.strip(),
+            "name": name,
+            "friend_code": friend_code,
             "organizer": is_organizer,
             "checked_in": False,
         }
 
         embed = discord.Embed(title="エントリーを受け付けました", color=discord.Color.green())
-        embed.add_field(name="大会で使用する名前", value=self.tournament_name.value, inline=False)
-        embed.add_field(name="フレンドコード", value=self.friend_code.value, inline=False)
+        embed.add_field(name="大会で使用する名前", value=name, inline=False)
+        embed.add_field(name="フレンドコード", value=friend_code, inline=False)
         embed.add_field(
             name="進行役",
             value="担当していただけます" if is_organizer else "担当なし",
@@ -309,11 +385,17 @@ class EntryModal(discord.ui.Modal, title="大会エントリー"):
         )
 
 
-@bot.tree.command(name="can", description="大会にエントリーします")
+@bot.tree.command(name="can", description="大会にエントリーします(FFA用)")
 async def can(interaction: discord.Interaction):
     if not has_entry_permission(interaction):
         await interaction.response.send_message(
             "このコマンドを使用する権限がありません。", ephemeral=True
+        )
+        return
+    current_format = get_format(interaction.guild_id)
+    if current_format != "FFA":
+        await interaction.response.send_message(
+            f"現在の大会形式は「{current_format}」です。/can_team を使用してください。", ephemeral=True
         )
         return
     await interaction.response.send_modal(EntryModal())
@@ -338,16 +420,30 @@ class DropModal(discord.ui.Modal, title="エントリー取り消し"):
             )
             return
 
-        if interaction.user.id in entries:
-            del entries[interaction.user.id]
-            await interaction.response.send_message(
-                "大会エントリーを取り消しました。", ephemeral=True
-            )
-            await update_entry_list(interaction.guild)
+        current_format = get_format(interaction.guild_id)
+        if current_format == "FFA":
+            if interaction.user.id in entries:
+                del entries[interaction.user.id]
+                await interaction.response.send_message(
+                    "大会エントリーを取り消しました。", ephemeral=True
+                )
+                await update_entry_list(interaction.guild)
+            else:
+                await interaction.response.send_message(
+                    "エントリー情報が見つかりませんでした。", ephemeral=True
+                )
         else:
-            await interaction.response.send_message(
-                "エントリー情報が見つかりませんでした。", ephemeral=True
-            )
+            if interaction.user.id in team_entries:
+                del team_entries[interaction.user.id]
+                await interaction.response.send_message(
+                    "チームのエントリーを取り消しました。", ephemeral=True
+                )
+                await update_entry_list(interaction.guild)
+            else:
+                await interaction.response.send_message(
+                    "チームのエントリー情報が見つかりませんでした(リーダーのみ取り消せます)。",
+                    ephemeral=True,
+                )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         log.exception(error)
@@ -364,6 +460,159 @@ async def drop(interaction: discord.Interaction):
         )
         return
     await interaction.response.send_modal(DropModal())
+
+
+# --------------------------------------------------------------------------
+# /can_team : チームで大会にエントリー(チーム戦形式のみ)
+# --------------------------------------------------------------------------
+_NAME_CODE_RE = re.compile(r"^(.+?)[ \u3000]+(\S+)$")
+
+
+class TeamEntryModal(discord.ui.Modal, title="チームエントリー"):
+    def __init__(self, team_size: int):
+        super().__init__()
+        self.team_size = team_size
+        self.tag = discord.ui.TextInput(
+            label="チームタグ", placeholder="例: ABC", required=True, max_length=10
+        )
+        self.team_name = discord.ui.TextInput(
+            label="チーム名", placeholder="例: あかつき", required=True, max_length=32
+        )
+        self.members = discord.ui.TextInput(
+            label=f"メンバー({team_size}行、1行に「名前 フレンドコード」)",
+            style=discord.TextStyle.paragraph,
+            placeholder="例:\nかぐや 0000-0000-0000\nあい 0000-0000-0001",
+            required=True,
+        )
+        self.add_item(self.tag)
+        self.add_item(self.team_name)
+        self.add_item(self.members)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        tag = self.tag.value.strip()
+        team_name = self.team_name.value.strip()
+        raw_lines = [line.strip() for line in self.members.value.splitlines() if line.strip()]
+
+        parsed: list[tuple[str, str]] = []
+        for line in raw_lines:
+            m = _NAME_CODE_RE.match(line)
+            if not m:
+                await interaction.response.send_message(
+                    f"形式が正しくない行があります: 「{line}」\n"
+                    "「名前 フレンドコード」の形式で、1行に1人ずつ入力してください。",
+                    ephemeral=True,
+                )
+                return
+            parsed.append((m.group(1).strip(), m.group(2).strip()))
+
+        if len(parsed) != self.team_size:
+            await interaction.response.send_message(
+                f"現在の大会形式ではメンバーは{self.team_size}人(行)必要です(入力: {len(parsed)}人)。",
+                ephemeral=True,
+            )
+            return
+
+        new_names = [n for n, _ in parsed]
+        if len(new_names) != len(set(new_names)):
+            await interaction.response.send_message(
+                "チーム内で名前が重複しています。", ephemeral=True
+            )
+            return
+
+        if tag in all_taken_tags(exclude_uid=interaction.user.id):
+            await interaction.response.send_message(
+                f"タグ「{tag}」は既に他のチームで使用されています。", ephemeral=True
+            )
+            return
+
+        taken_names = all_taken_names(exclude_uid=interaction.user.id)
+        dup_names = [n for n in new_names if n in taken_names]
+        if dup_names:
+            await interaction.response.send_message(
+                f"名前「{'、'.join(dup_names)}」は既に他の参加者(またはチーム)で使用されています。",
+                ephemeral=True,
+            )
+            return
+
+        team_entries[interaction.user.id] = {
+            "tag": tag,
+            "team_name": team_name,
+            "members": [{"name": n, "friend_code": c} for n, c in parsed],
+            "checked_in": False,
+        }
+
+        embed = discord.Embed(title="チームエントリーを受け付けました", color=discord.Color.green())
+        embed.add_field(name="タグ", value=tag, inline=False)
+        embed.add_field(name="チーム名", value=team_name, inline=False)
+        embed.add_field(
+            name="メンバー", value="\n".join(f"{n} {c}" for n, c in parsed), inline=False
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await update_entry_list(interaction.guild)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception(error)
+        await interaction.response.send_message(
+            "エントリー処理中にエラーが発生しました。もう一度お試しください。", ephemeral=True
+        )
+
+
+@bot.tree.command(name="can_team", description="大会にチームでエントリーします(チーム戦形式用)")
+async def can_team(interaction: discord.Interaction):
+    if not has_entry_permission(interaction):
+        await interaction.response.send_message(
+            "このコマンドを使用する権限がありません。", ephemeral=True
+        )
+        return
+    current_format = get_format(interaction.guild_id)
+    if current_format == "FFA":
+        await interaction.response.send_message(
+            "現在の大会形式はFFAです。/can を使用してください。", ephemeral=True
+        )
+        return
+    team_size = get_team_size(interaction.guild_id)
+    await interaction.response.send_modal(TeamEntryModal(team_size))
+
+
+# --------------------------------------------------------------------------
+# /format : 大会形式を設定(管理者・主催専用)
+# --------------------------------------------------------------------------
+@bot.tree.command(name="format", description="【管理者・主催用】大会形式を設定します")
+@app_commands.describe(format="大会形式")
+@app_commands.choices(
+    format=[
+        app_commands.Choice(name="FFA", value="FFA"),
+        app_commands.Choice(name="2v2", value="2v2"),
+        app_commands.Choice(name="3v3", value="3v3"),
+        app_commands.Choice(name="4v4", value="4v4"),
+        app_commands.Choice(name="6v6", value="6v6"),
+        app_commands.Choice(name="8v8", value="8v8"),
+        app_commands.Choice(name="12v12", value="12v12"),
+    ]
+)
+@is_admin_or_organizer()
+async def format_(interaction: discord.Interaction, format: app_commands.Choice[str]):
+    tournament_formats[interaction.guild_id] = format.value
+    if format.value == "FFA":
+        note = "今後は /can /drop が使用できます。"
+    else:
+        note = "今後は /can_team /drop が使用できます。"
+    await interaction.response.send_message(
+        f"大会形式を「{format.value}」に設定しました。{note}", ephemeral=True
+    )
+
+
+@format_.error
+async def format_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message(
+            "このコマンドは管理者、または主催ロールを持つ人のみ使用できます。", ephemeral=True
+        )
+    else:
+        log.exception(error)
+        await interaction.response.send_message(
+            "コマンド実行中にエラーが発生しました。", ephemeral=True
+        )
 
 
 # --------------------------------------------------------------------------
@@ -580,14 +829,24 @@ class CheckinView(discord.ui.View):
         emoji="✅",
     )
     async def checkin_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in entries:
-            await interaction.response.send_message(
-                "エントリー情報が見つかりません。先に /can でエントリーしてください。",
-                ephemeral=True,
-            )
-            return
+        current_format = get_format(interaction.guild_id)
+        if current_format == "FFA":
+            if interaction.user.id not in entries:
+                await interaction.response.send_message(
+                    "エントリー情報が見つかりません。先に /can でエントリーしてください。",
+                    ephemeral=True,
+                )
+                return
+            entries[interaction.user.id]["checked_in"] = True
+        else:
+            if interaction.user.id not in team_entries:
+                await interaction.response.send_message(
+                    "チームのエントリー情報が見つかりません。リーダーが /can_team でエントリーしてください。",
+                    ephemeral=True,
+                )
+                return
+            team_entries[interaction.user.id]["checked_in"] = True
 
-        entries[interaction.user.id]["checked_in"] = True
         await interaction.response.send_message("チェックインしました！", ephemeral=True)
         await update_entry_list(interaction.guild)
 
@@ -674,9 +933,11 @@ async def checkin_scheduler():
 
         # 2. 開始10分前 : 未チェックインの人にメンション付きリマインド
         if not info["reminder_sent"] and now >= info["target"] - timedelta(minutes=10):
-            pending_ids = [
-                uid for uid, data in entries.items() if not data.get("checked_in")
-            ]
+            current_format = get_format(guild_id)
+            if current_format == "FFA":
+                pending_ids = [uid for uid, data in entries.items() if not data.get("checked_in")]
+            else:
+                pending_ids = [uid for uid, team in team_entries.items() if not team.get("checked_in")]
             if pending_ids:
                 mentions = " ".join(f"<@{uid}>" for uid in pending_ids)
                 try:
@@ -689,17 +950,22 @@ async def checkin_scheduler():
 
         # 3. 開始時刻 : 未チェックインの人を自動でエントリー削除
         if not info["deadline_processed"] and now >= info["target"]:
-            removed_ids = [
-                uid for uid, data in entries.items() if not data.get("checked_in")
-            ]
-            for uid in removed_ids:
-                del entries[uid]
+            current_format = get_format(guild_id)
+            if current_format == "FFA":
+                removed_ids = [uid for uid, data in entries.items() if not data.get("checked_in")]
+                for uid in removed_ids:
+                    del entries[uid]
+            else:
+                removed_ids = [uid for uid, team in team_entries.items() if not team.get("checked_in")]
+                for uid in removed_ids:
+                    del team_entries[uid]
 
             if removed_ids:
+                unit = "名" if current_format == "FFA" else "チーム"
                 try:
                     await channel.send(
                         "締切になりました。未チェックインだった "
-                        f"{len(removed_ids)}名 のエントリーを自動的に取り消しました。"
+                        f"{len(removed_ids)}{unit} のエントリーを自動的に取り消しました。"
                     )
                 except discord.Forbidden:
                     log.warning(f"チェックインチャンネル({info['channel_id']})への投稿権限がありません。")
@@ -714,7 +980,7 @@ async def checkin_scheduler():
 @bot.tree.command(name="room", description="【管理者・主催用】チェックイン済みの参加者を部屋分けし、スレッドを作成します")
 @app_commands.describe(
     round_name="スレッド名の元になる名前(例: Round1)",
-    room_size="1部屋あたりの人数",
+    room_size="1部屋あたりの人数(チーム戦の場合はチーム数)",
     thread_channel="スレッドを作成するチャンネル",
     announce_channel="組分け結果を投稿するチャンネル",
 )
@@ -728,12 +994,17 @@ async def room(
 ):
     await interaction.response.defer(ephemeral=True)
 
-    # チェックイン済みの人だけを対象にする
-    target = [(uid, data) for uid, data in entries.items() if data.get("checked_in")]
+    current_format = get_format(interaction.guild_id)
+    if current_format == "FFA":
+        target = [(uid, data) for uid, data in entries.items() if data.get("checked_in")]
+        unit = "名"
+    else:
+        target = [(uid, team) for uid, team in team_entries.items() if team.get("checked_in")]
+        unit = "チーム"
 
     if len(target) < room_size:
         await interaction.followup.send(
-            f"チェックイン済みの人数({len(target)}名)が、1部屋の人数({room_size}名)に足りません。",
+            f"チェックイン済みの{unit}数({len(target)}{unit})が、1部屋あたり({room_size}{unit})に足りません。",
             ephemeral=True,
         )
         return
@@ -767,10 +1038,18 @@ async def room(
             log.exception(f"{thread_name} のスレッド作成に失敗しました")
             continue
 
-        organizers_in_room = [data["name"] for _, data in group if data.get("organizer")]
-        member_lines = [f"{data['name']}　{data['friend_code']}" for _, data in group]
-        facilitator_line = "進行役：" + ("、".join(organizers_in_room) if organizers_in_room else "なし")
-        thread_content = "\n".join(member_lines) + "\n\n" + facilitator_line
+        if current_format == "FFA":
+            organizers_in_room = [data["name"] for _, data in group if data.get("organizer")]
+            member_lines = [f"{data['name']}　{data['friend_code']}" for _, data in group]
+            facilitator_line = "進行役：" + ("、".join(organizers_in_room) if organizers_in_room else "なし")
+            thread_content = "\n".join(member_lines) + "\n\n" + facilitator_line
+        else:
+            team_blocks = []
+            for _, team in group:
+                block = [f"[{team['tag']}] {team['team_name']}"]
+                block += [f"　{m['name']} {m['friend_code']}" for m in team["members"]]
+                team_blocks.append("\n".join(block))
+            thread_content = "\n\n".join(team_blocks)
 
         try:
             await thread.send(thread_content)
@@ -780,9 +1059,13 @@ async def room(
         created_threads += 1
 
         summary_lines.append(f"\n{room_label}")
-        for _, data in group:
-            prefix = "進★" if data.get("organizer") else ""
-            summary_lines.append(f"{prefix}{data['name']}")
+        if current_format == "FFA":
+            for _, data in group:
+                prefix = "進★" if data.get("organizer") else ""
+                summary_lines.append(f"{prefix}{data['name']}")
+        else:
+            for _, team in group:
+                summary_lines.append(f"[{team['tag']}] {team['team_name']}")
 
     summary_text = "\n".join(summary_lines)
     try:
@@ -797,8 +1080,11 @@ async def room(
 
     leftover_note = ""
     if leftover:
-        leftover_names = "、".join(data["name"] for _, data in leftover)
-        leftover_note = f"\n切り捨てられた{len(leftover)}名: {leftover_names}"
+        if current_format == "FFA":
+            leftover_names = "、".join(data["name"] for _, data in leftover)
+        else:
+            leftover_names = "、".join(team["team_name"] for _, team in leftover)
+        leftover_note = f"\n切り捨てられた{len(leftover)}{unit}: {leftover_names}"
 
     await interaction.followup.send(
         f"{created_threads}個のスレッドを作成し、{announce_channel.mention} に組分け結果を投稿しました。"
@@ -899,11 +1185,38 @@ async def result_error(interaction: discord.Interaction, error: app_commands.App
 
 
 # --------------------------------------------------------------------------
+# /passlist : 通過者リストだけをまとめて投稿するチャンネルを指定(管理者・主催専用)
+# --------------------------------------------------------------------------
+@bot.tree.command(name="passlist", description="【管理者・主催用】通過者リストをまとめて投稿するチャンネルを指定します")
+@app_commands.describe(channel="通過者リストを投稿するチャンネル")
+@is_admin_or_organizer()
+async def passlist(interaction: discord.Interaction, channel: discord.TextChannel):
+    passlist_channels[interaction.guild_id] = channel.id
+    await interaction.response.send_message(
+        f"設定しました。今後リザルト確定時に {channel.mention} へ通過者リストをまとめて投稿します。",
+        ephemeral=True,
+    )
+
+
+@passlist.error
+async def passlist_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message(
+            "このコマンドは管理者、または主催ロールを持つ人のみ使用できます。", ephemeral=True
+        )
+    else:
+        log.exception(error)
+        await interaction.response.send_message(
+            "コマンド実行中にエラーが発生しました。", ephemeral=True
+        )
+
+
+# --------------------------------------------------------------------------
 # /table : スレッド内でスコアボードを作成(管理者・主催・進行役専用)
 # --------------------------------------------------------------------------
 def render_scoreboard(thread_id: int) -> str:
     board = scoreboards[thread_id]
-    lines = ["数字だけを送信すると、あなたのスコアが自動で更新されます", ""]
+    lines = ["!submit", ""]
     for uid, score in board["scores"].items():
         lines.append(f"{board['names'][uid]}　{score}")
     return "\n".join(lines)
@@ -1134,6 +1447,16 @@ async def finalize_result(message: discord.Message, ranked_uids: list[tuple[int,
         await message.channel.send(f"⚠️ {channel.mention} への投稿権限がありません。")
         return
 
+    # /passlist で指定されていれば、通過者リストだけをまとめて別チャンネルにも投稿する
+    passlist_channel_id = passlist_channels.get(guild.id)
+    if passlist_channel_id is not None:
+        passlist_channel = guild.get_channel(passlist_channel_id)
+        if passlist_channel is not None:
+            try:
+                await passlist_channel.send("\n".join(lines))
+            except discord.Forbidden:
+                log.warning(f"通過者リストチャンネル({passlist_channel_id})への投稿権限がありません。")
+
     # 通過者だけをエントリー一覧に残し、次ラウンドに向けてチェックイン状態をリセットする
     for uid in list(entries.keys()):
         if uid in advancing_uids:
@@ -1192,17 +1515,27 @@ async def help_(interaction: discord.Interaction):
     )
     embed.add_field(
         name="/can",
-        value="大会にエントリーします(名前・フレンドコードを入力。進行役希望なら「はい」)。",
+        value="大会にエントリーします(FFA形式用。名前・フレンドコードを入力。進行役希望なら「はい」)。",
+        inline=False,
+    )
+    embed.add_field(
+        name="/can_team",
+        value="大会にチームでエントリーします(FFA以外の形式用。使った人がリーダーになります)。",
         inline=False,
     )
     embed.add_field(
         name="/drop",
-        value="大会のエントリーを取り消します(確認欄に「はい」と入力した場合のみ成立)。",
+        value="大会のエントリーを取り消します(確認欄に「はい」と入力した場合のみ成立。チーム戦はリーダーのみ)。",
         inline=False,
     )
     embed.add_field(
         name="/help",
         value="このコマンド一覧を表示します。",
+        inline=False,
+    )
+    embed.add_field(
+        name="🔒 /format 【管理者・主催用】",
+        value="大会形式(FFA/2v2/3v3/4v4/6v6/8v8/12v12)を設定します。",
         inline=False,
     )
     embed.add_field(
@@ -1262,6 +1595,11 @@ async def help_(interaction: discord.Interaction):
             "スレッド内でスコアボードを貼り付けると集計画像が自動生成され、"
             "✅6票 or 30秒後に✅優勢で確定・投稿されます。"
         ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔒 /passlist 【管理者・主催用】",
+        value="通過者リストだけをまとめて投稿するチャンネルを指定します(/result確定時に自動投稿)。",
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
